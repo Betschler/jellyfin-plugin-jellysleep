@@ -16,8 +16,9 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     private readonly ConcurrentDictionary<UserDeviceKey, ActiveSleepTimer> _activeTimers;
     private readonly ConcurrentDictionary<UserDeviceKey, SemaphoreSlim> _timerLocks;
     private readonly ConcurrentDictionary<UserDeviceKey, CompletionCooldown> _completionCooldowns;
-    private readonly Timer _cleanupTimer;
+
     private const int CooldownSeconds = 3;
+    private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SleepTimerService"/> class.
@@ -31,9 +32,6 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
         _activeTimers = new ConcurrentDictionary<UserDeviceKey, ActiveSleepTimer>();
         _timerLocks = new ConcurrentDictionary<UserDeviceKey, SemaphoreSlim>();
         _completionCooldowns = new ConcurrentDictionary<UserDeviceKey, CompletionCooldown>();
-
-        // Setup cleanup timer to run every 30 seconds
-        _cleanupTimer = new Timer(async _ => await CleanupTimersAsync().ConfigureAwait(false), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
     /// <summary>
@@ -482,7 +480,7 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
             try
             {
                 await CleanupTimersAsync().ConfigureAwait(false);
-                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken).ConfigureAwait(false);
+                await Task.Delay(CleanupInterval, stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -500,6 +498,107 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     }
 
     /// <summary>
+    /// Find the best target sessions for a user/device sleep timer.
+    /// Prefer playback sessions on the same device, but fall back to playback
+    /// sessions for the same user when Android/WebView device IDs do not match.
+    /// </summary>
+    /// <param name="userId">The user ID.</param>
+    /// <param name="deviceId">The device ID, if known.</param>
+    /// <returns>Matching target sessions.</returns>
+    private List<SessionInfo> GetTargetSessions(Guid userId, string? deviceId)
+    {
+        var userSessions = _sessionManager.Sessions
+            .Where(s => s.UserId == userId)
+            .ToList();
+
+        if (userSessions.Count == 0)
+        {
+            return userSessions;
+        }
+
+        if (string.IsNullOrEmpty(deviceId))
+        {
+            return userSessions;
+        }
+
+        var sameDeviceSessions = userSessions
+            .Where(s => s.DeviceId == deviceId)
+            .ToList();
+
+        var sameDevicePlaybackSessions = sameDeviceSessions
+            .Where(s => s.NowPlayingItem is not null)
+            .ToList();
+
+        if (sameDevicePlaybackSessions.Count > 0)
+        {
+            return sameDevicePlaybackSessions;
+        }
+
+        var userPlaybackSessions = userSessions
+            .Where(s => s.NowPlayingItem is not null)
+            .ToList();
+
+        if (userPlaybackSessions.Count > 0)
+        {
+            _logger.LogWarning(
+                "No playback session found for user {UserId} on device {DeviceId}. Falling back to {SessionCount} playback session(s) for same user.",
+                userId,
+                deviceId,
+                userPlaybackSessions.Count);
+
+            return userPlaybackSessions;
+        }
+
+        if (sameDeviceSessions.Count > 0)
+        {
+            return sameDeviceSessions;
+        }
+
+        _logger.LogWarning(
+            "No session found for user {UserId} on device {DeviceId}. Falling back to all {SessionCount} session(s) for same user.",
+            userId,
+            deviceId,
+            userSessions.Count);
+
+        return userSessions;
+    }
+
+    /// <summary>
+    /// Determines whether the current session is playing audio/music content.
+    /// Audio sessions are paused on timer completion so track progress is preserved.
+    /// </summary>
+    /// <param name="session">The playback session.</param>
+    /// <returns>True if the session is playing audio content, false otherwise.</returns>
+    private static bool IsAudioSession(SessionInfo session)
+    {
+        var item = session.NowPlayingItem;
+
+        if (item is null)
+        {
+            return false;
+        }
+
+        var mediaType = Convert.ToString(item.MediaType, System.Globalization.CultureInfo.InvariantCulture);
+        var itemType = Convert.ToString(item.Type, System.Globalization.CultureInfo.InvariantCulture);
+
+        return string.Equals(mediaType, "Audio", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(itemType, "Audio", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Selects the playstate command to send when a sleep timer completes.
+    /// Music/audio is paused to preserve progress; video keeps the previous stop behavior.
+    /// </summary>
+    /// <param name="session">The playback session.</param>
+    /// <returns>The playstate command to send.</returns>
+    private static MediaBrowser.Model.Session.PlaystateCommand GetTimerCompletionCommand(SessionInfo session)
+    {
+        return IsAudioSession(session)
+            ? MediaBrowser.Model.Session.PlaystateCommand.Pause
+            : MediaBrowser.Model.Session.PlaystateCommand.Stop;
+    }
+
+    /// <summary>
     /// Stop playback for a specific user and device combination.
     /// </summary>
     /// <param name="userId">The user ID.</param>
@@ -509,35 +608,35 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     {
         try
         {
-            // Dynamically find sessions based on userId and deviceId
-            var sessions = _sessionManager.Sessions
-                .Where(s => s.UserId == userId &&
-                           (string.IsNullOrEmpty(deviceId) || s.DeviceId == deviceId))
-                .ToList();
+            var sessions = GetTargetSessions(userId, deviceId);
 
             _logger.LogInformation(
-                "Found {SessionCount} active sessions for user {UserId} on device {DeviceId}",
+                "Found {SessionCount} target session(s) for user {UserId} on device {DeviceId}",
                 sessions.Count,
                 userId,
                 deviceId ?? "any");
 
             foreach (var session in sessions)
             {
+                var command = GetTimerCompletionCommand(session);
+
                 _logger.LogInformation(
-                    "Stopping playback for user {UserId} in session {SessionId} on device {DeviceId}",
+                    "{Command} playback for user {UserId} in session {SessionId} on device {DeviceId}, media type {MediaType}, item type {ItemType}",
+                    command,
                     userId,
                     session.Id,
-                    session.DeviceId ?? "unknown");
+                    session.DeviceId ?? "unknown",
+                    session.NowPlayingItem?.MediaType,
+                    session.NowPlayingItem?.Type);
 
                 await _sessionManager.SendPlaystateCommand(
                     session.Id,
                     session.Id,
                     new MediaBrowser.Model.Session.PlaystateRequest
                     {
-                        Command = MediaBrowser.Model.Session.PlaystateCommand.Stop
+                        Command = command
                     },
                     CancellationToken.None).ConfigureAwait(false);
-
             }
         }
         catch (Exception ex)
@@ -554,20 +653,18 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     /// <returns>True if the user has an active session, false otherwise.</returns>
     private bool IsUserSessionActive(Guid userId, string? deviceId = null)
     {
-        return _sessionManager.Sessions.Any(s => s.UserId == userId &&
-            (string.IsNullOrEmpty(deviceId) || s.DeviceId == deviceId));
+        return GetTargetSessions(userId, deviceId).Count > 0;
     }
 
     /// <inheritdoc />
     public override void Dispose()
     {
-        _cleanupTimer?.Dispose();
-
         // Dispose all semaphores
         foreach (var semaphore in _timerLocks.Values)
         {
             semaphore.Dispose();
         }
+
         _timerLocks.Clear();
 
         base.Dispose();

@@ -466,6 +466,40 @@
         const scroller = document.createElement('div');
         scroller.className = 'actionSheetScroller scrollY';
 
+        if (isActive) {
+            const cancelMenuItem = document.createElement('button');
+            cancelMenuItem.setAttribute('is', 'emby-button');
+            cancelMenuItem.setAttribute('type', 'button');
+            cancelMenuItem.className = 'listItem listItem-button actionSheetMenuItem emby-button';
+            cancelMenuItem.setAttribute('data-id', 'cancelTimer');
+
+            if (isLoadingStatus) {
+                cancelMenuItem.disabled = true;
+                cancelMenuItem.style.opacity = '0.5';
+            }
+
+            const cancelItemBody = document.createElement('div');
+            cancelItemBody.className = 'listItemBody actionsheetListItemBody';
+
+            const cancelItemText = document.createElement('div');
+            cancelItemText.className = 'listItemBodyText actionSheetItemText';
+            cancelItemText.textContent = isLoadingStatus ? 'Cancel timer (Loading...)' : 'Cancel timer';
+
+            cancelItemBody.appendChild(cancelItemText);
+            cancelMenuItem.appendChild(cancelItemBody);
+
+            cancelMenuItem.addEventListener('click', () => {
+                if (isLoadingStatus) {
+                    return;
+                }
+
+                cancelSleepTimer();
+                closeSleepActionSheet();
+            });
+
+            scroller.appendChild(cancelMenuItem);
+        }
+
         // Add menu items
         Object.keys(SLEEP_OPTIONS).forEach(key => {
             const option = SLEEP_OPTIONS[key];

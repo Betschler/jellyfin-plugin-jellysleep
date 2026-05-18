@@ -19,6 +19,7 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
 
     private const int CooldownSeconds = 3;
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan TimerCompletionRetryWindow = TimeSpan.FromMinutes(2);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SleepTimerService"/> class.
@@ -447,7 +448,31 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
                     userDeviceKey.DeviceId);
 
                 // Stop playback for this user/device combination
-                await StopPlaybackForUserAsync(timer.UserId, timer.DeviceId).ConfigureAwait(false);
+                var commandSent = await StopPlaybackForUserAsync(timer.UserId, timer.DeviceId).ConfigureAwait(false);
+
+                if (!commandSent)
+                {
+                    var retryUntil = timer.EndTime.GetValueOrDefault().Add(TimerCompletionRetryWindow);
+
+                    if (DateTime.UtcNow < retryUntil)
+                    {
+                        _logger.LogWarning(
+                            "Duration-based timer {TimerId} expired for user {UserId} on device {DeviceId}, but no playback command was sent. Keeping timer active and retrying until {RetryUntil}",
+                            timer.Id,
+                            timer.UserId,
+                            userDeviceKey.DeviceId,
+                            retryUntil);
+
+                        continue;
+                    }
+
+                    _logger.LogWarning(
+                        "Duration-based timer {TimerId} expired for user {UserId} on device {DeviceId}, but no playback command was sent within {RetryWindow}. Removing timer.",
+                        timer.Id,
+                        timer.UserId,
+                        userDeviceKey.DeviceId,
+                        TimerCompletionRetryWindow);
+                }
             }
 
             // Remove the timer and its lock
@@ -603,8 +628,8 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     /// </summary>
     /// <param name="userId">The user ID.</param>
     /// <param name="deviceId">The device ID (optional).</param>
-    /// <returns>A task representing the async operation.</returns>
-    private async Task StopPlaybackForUserAsync(Guid userId, string? deviceId)
+    /// <returns>True if at least one playback command was sent successfully; otherwise, false.</returns>
+    private async Task<bool> StopPlaybackForUserAsync(Guid userId, string? deviceId)
     {
         try
         {
@@ -615,6 +640,18 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
                 sessions.Count,
                 userId,
                 deviceId ?? "any");
+
+            if (sessions.Count == 0)
+            {
+                _logger.LogWarning(
+                    "No target session found for user {UserId} on device {DeviceId}; playback command was not sent",
+                    userId,
+                    deviceId ?? "any");
+
+                return false;
+            }
+
+            var commandSent = false;
 
             foreach (var session in sessions)
             {
@@ -629,19 +666,37 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
                     session.NowPlayingItem?.MediaType,
                     session.NowPlayingItem?.Type);
 
-                await _sessionManager.SendPlaystateCommand(
-                    session.Id,
-                    session.Id,
-                    new MediaBrowser.Model.Session.PlaystateRequest
-                    {
-                        Command = command
-                    },
-                    CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    await _sessionManager.SendPlaystateCommand(
+                        session.Id,
+                        session.Id,
+                        new MediaBrowser.Model.Session.PlaystateRequest
+                        {
+                            Command = command
+                        },
+                        CancellationToken.None).ConfigureAwait(false);
+
+                    commandSent = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Error sending {Command} command for user {UserId} in session {SessionId} on device {DeviceId}",
+                        command,
+                        userId,
+                        session.Id,
+                        session.DeviceId ?? "unknown");
+                }
             }
+
+            return commandSent;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error stopping playback for user {UserId} on device {DeviceId}", userId, deviceId);
+            return false;
         }
     }
 
